@@ -8,9 +8,12 @@ venv/
 .env
 
 # Project-specific
-checkpoints/
-output/
-inputs/*.csv
+checkpoints/*
+!checkpoints/.gitkeep
+output/*
+!output/.gitkeep
+inputs/*
+!inputs/.gitkeep
 
 # IDE
 .idea/
