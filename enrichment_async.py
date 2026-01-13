@@ -53,6 +53,7 @@ class AsyncMixRankEnricher:
             )
         
         self.base_url = f"https://api.mixrank.com/v2/json/{self.api_key}/linkedin/profile"
+        
         self.concurrency = concurrency
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.max_retries = max_retries

@@ -4,6 +4,16 @@ A tool for identifying **false positives** in Salesforce leads flagged as "No Lo
 
 ---
 
+> ⚠️ **IMPORTANT: Always use the async version with concurrency 20**
+>
+> ```bash
+> python nlaa_analyzer_async.py --concurrency 20 [other options]
+> ```
+>
+> Do NOT use `nlaa_analyzer.py` (sequential version) — it's 15x slower.
+
+---
+
 ## Overview
 
 When leads are marked as NLAA in Salesforce, some are incorrectly flagged—the person is actually still at the company. This tool:
