@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from openai import OpenAI
+from openai import OpenAI, AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -382,6 +382,136 @@ Does the account name match any of these companies?"""
         return self.stats.copy()
 
 
+class AsyncLLMMatcher:
+    """
+    Async LLM-based company name matcher for ambiguous cases.
+    Uses AsyncOpenAI for non-blocking API calls.
+    """
+    
+    SYSTEM_PROMPT = """You are an expert at matching company names between Salesforce account names and LinkedIn experience entries.
+
+Your task: Determine if the given account name matches any company in the experience list.
+
+Rules:
+1. Account names may have additional text (divisions, regions) not in LinkedIn
+2. Company names may be abbreviated or shortened
+3. Focus on the core company name, ignoring suffixes like Inc, LLC, Corp
+4. A match means the person works at the same company, even if titles differ
+
+Return JSON only:
+{"match": true/false, "company": "matching company name or null", "reason": "brief explanation"}"""
+
+    def __init__(self, model: str = "gpt-4o-mini"):
+        self.client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        self.model = model
+        self.stats = {"calls": 0, "matches": 0, "no_matches": 0, "errors": 0}
+    
+    async def match(
+        self,
+        account_name: str,
+        experiences: list[dict],
+        current_only: bool = True
+    ) -> MatchResult:
+        """
+        Use LLM to determine if account name matches any experience.
+        Non-blocking async implementation.
+        """
+        # Filter to current experiences
+        if current_only:
+            exp_list = [
+                exp for exp in experiences
+                if exp.get('is_current', False) or exp.get('end_date') is None
+            ]
+        else:
+            exp_list = experiences
+        
+        if not exp_list:
+            return MatchResult(
+                account_name=account_name,
+                matched=False,
+                confidence=MatchConfidence.NO_MATCH,
+                match_reason="No experiences to match against",
+                llm_used=True
+            )
+        
+        # Build experience list for prompt
+        exp_text = "\n".join([
+            f"- {exp.get('company', 'Unknown')} (Title: {exp.get('title', 'Unknown')})"
+            for exp in exp_list
+        ])
+        
+        user_prompt = f"""Account name: {account_name}
+
+Current LinkedIn experiences:
+{exp_text}
+
+Does the account name match any of these companies?"""
+
+        self.stats["calls"] += 1
+        
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ],
+                response_format={"type": "json_object"},
+                max_completion_tokens=200
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            
+            matched = result.get("match", False)
+            matched_company = result.get("company")
+            reason = result.get("reason", "")
+            
+            if matched:
+                self.stats["matches"] += 1
+                # Find the matching experience object
+                matching_exp = None
+                for exp in exp_list:
+                    if exp.get('company') == matched_company:
+                        matching_exp = exp
+                        break
+                
+                return MatchResult(
+                    account_name=account_name,
+                    matched=True,
+                    confidence=MatchConfidence.HIGH,  # LLM confirmed
+                    matching_experience=matching_exp,
+                    match_reason=f"LLM: {reason}",
+                    similarity_score=0.9,  # High confidence from LLM
+                    llm_used=True,
+                    all_current_companies=[e.get('company', '') for e in exp_list]
+                )
+            else:
+                self.stats["no_matches"] += 1
+                return MatchResult(
+                    account_name=account_name,
+                    matched=False,
+                    confidence=MatchConfidence.NO_MATCH,
+                    match_reason=f"LLM: {reason}",
+                    llm_used=True,
+                    all_current_companies=[e.get('company', '') for e in exp_list]
+                )
+                
+        except Exception as ex:
+            self.stats["errors"] += 1
+            return MatchResult(
+                account_name=account_name,
+                matched=False,
+                confidence=MatchConfidence.LOW,
+                match_reason=f"LLM error: {str(ex)}",
+                llm_used=True,
+                llm_error=True,
+                all_current_companies=[exp.get('company', '') for exp in exp_list]
+            )
+    
+    def get_stats(self) -> dict:
+        return self.stats.copy()
+
+
 class HybridMatcher:
     """
     Hybrid matching engine combining programmatic and LLM approaches.
@@ -429,6 +559,73 @@ class HybridMatcher:
         if self.use_llm and result.confidence == MatchConfidence.LOW:
             self.stats["llm_calls"] += 1
             llm_result = self.llm_matcher.match(account_name, experiences)
+            
+            if llm_result.matched:
+                self.stats["llm_matches"] += 1
+            else:
+                self.stats["no_matches"] += 1
+            
+            return llm_result
+        
+        # No match found
+        self.stats["no_matches"] += 1
+        return result
+    
+    def get_stats(self) -> dict:
+        stats = self.stats.copy()
+        if self.llm_matcher:
+            stats["llm_stats"] = self.llm_matcher.get_stats()
+        return stats
+
+
+class AsyncHybridMatcher:
+    """
+    Async hybrid matching engine combining programmatic and LLM approaches.
+    
+    Strategy:
+    1. Try programmatic match first (synchronous, fast)
+    2. If HIGH or MEDIUM confidence -> return result
+    3. If LOW confidence -> use async LLM fallback
+    4. If NO_MATCH with partial signals -> use async LLM fallback
+    """
+    
+    def __init__(self, use_llm: bool = True, model: str = "gpt-4o-mini"):
+        self.use_llm = use_llm
+        self.llm_matcher = AsyncLLMMatcher(model=model) if use_llm else None
+        
+        self.stats = {
+            "total": 0,
+            "programmatic_matches": 0,
+            "llm_matches": 0,
+            "no_matches": 0,
+            "llm_calls": 0,
+        }
+    
+    async def match(
+        self,
+        account_name: str,
+        experiences: list[dict]
+    ) -> MatchResult:
+        """
+        Match account name to experiences using hybrid approach.
+        Async method that yields to event loop during LLM calls.
+        """
+        self.stats["total"] += 1
+        
+        # Step 1: Try programmatic match (fast, synchronous)
+        result = programmatic_match(account_name, experiences)
+        
+        # Step 2: Check if we need LLM fallback
+        if result.confidence in (MatchConfidence.HIGH, MatchConfidence.MEDIUM):
+            # Good programmatic match - use it
+            if result.matched:
+                self.stats["programmatic_matches"] += 1
+            return result
+        
+        # Step 3: Use async LLM for low confidence or ambiguous cases
+        if self.use_llm and result.confidence == MatchConfidence.LOW:
+            self.stats["llm_calls"] += 1
+            llm_result = await self.llm_matcher.match(account_name, experiences)
             
             if llm_result.matched:
                 self.stats["llm_matches"] += 1

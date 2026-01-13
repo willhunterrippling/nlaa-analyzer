@@ -31,9 +31,9 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from url_normalizer import normalize_linkedin_url
-from checkpoint import CheckpointManager
+from checkpoint import AsyncCheckpointManager, CheckpointManager
 from enrichment_async import AsyncMixRankEnricher, AsyncProgressTracker
-from matching import HybridMatcher, MatchConfidence
+from matching import AsyncHybridMatcher, MatchConfidence
 
 load_dotenv()
 
@@ -388,14 +388,14 @@ async def run_analysis_async(
     output_path.mkdir(parents=True, exist_ok=True)
     print(f"\n📁 Output folder: {output_path}")
     
-    # Initialize checkpoint manager
-    checkpoint_mgr = CheckpointManager(
+    # Initialize async checkpoint manager
+    checkpoint_mgr = AsyncCheckpointManager(
         checkpoint_dir=CHECKPOINT_DIR,
         checkpoint_interval=checkpoint_interval
     )
     
     if resume:
-        if checkpoint_mgr.load_checkpoint():
+        if await checkpoint_mgr.load_checkpoint():
             print(f"\n✓ Resuming from checkpoint")
             progress = checkpoint_mgr.get_progress()
             print(f"  Previously processed: {progress['processed']}/{progress['total']}")
@@ -461,9 +461,9 @@ async def run_analysis_async(
             print(f"   ✗ Error: {e}")
             sys.exit(1)
     
-    # Initialize matcher
-    print(f"\n🎯 Initializing matcher (LLM: {'enabled' if use_llm else 'disabled'})")
-    matcher = HybridMatcher(use_llm=use_llm, model=llm_model)
+    # Initialize async matcher
+    print(f"\n🎯 Initializing async matcher (LLM: {'enabled' if use_llm else 'disabled'})")
+    matcher = AsyncHybridMatcher(use_llm=use_llm, model=llm_model)
     
     # Process records
     print(f"\n{'=' * 70}")
@@ -493,14 +493,21 @@ async def run_analysis_async(
     
     print(f"\n   Processing {total_to_process:,} records with {concurrency} concurrent requests...")
     
-    async def process_result(result):
+    # Semaphore to limit concurrent matching operations (especially LLM calls)
+    match_semaphore = asyncio.Semaphore(concurrency)
+    
+    # Lock for thread-safe updates to shared state
+    state_lock = asyncio.Lock()
+    
+    async def process_single_result(result):
+        """Process a single enrichment result with async matching."""
         nonlocal processed_count, success_count, error_count
         
         record_id = result.record_id
         record = record_by_id.get(record_id)
         
         if not record:
-            return
+            return None
         
         account_name = record.get('ACCOUNT_NAME', '')
         
@@ -508,8 +515,9 @@ async def run_analysis_async(
             enrichment_cache[record_id] = result.data
             experiences = result.data.get('experience', [])
             
-            # Match account name to experiences
-            match_result = matcher.match(account_name, experiences)
+            # Match account name to experiences (async, non-blocking for LLM calls)
+            async with match_semaphore:
+                match_result = await matcher.match(account_name, experiences)
             
             result_record = {
                 **record,
@@ -524,68 +532,99 @@ async def run_analysis_async(
                 **format_experience_for_output(match_result.matching_experience),
             }
             
-            results.append(result_record)
+            # Thread-safe updates to shared collections
+            async with state_lock:
+                results.append(result_record)
+                
+                if match_result.llm_error:
+                    llm_errors.append(result_record)
+                elif match_result.matched:
+                    false_positives.append(result_record)
+                elif match_result.confidence == MatchConfidence.LOW:
+                    ambiguous_cases.append(result_record)
+                
+                success_count += 1
+                processed_count += 1
             
-            if match_result.llm_error:
-                llm_errors.append(result_record)
-            elif match_result.matched:
-                false_positives.append(result_record)
-            elif match_result.confidence == MatchConfidence.LOW:
-                ambiguous_cases.append(result_record)
-            
-            checkpoint_mgr.record_processed(record_id, success=True, enriched_data=result.data)
-            success_count += 1
+            # Checkpoint (outside lock to avoid blocking, async I/O)
+            await checkpoint_mgr.record_processed(record_id, success=True, enriched_data=result.data)
         else:
             result_record = {
                 **record,
                 'enrichment_success': False,
                 'enrichment_error': result.error,
             }
-            results.append(result_record)
-            checkpoint_mgr.record_processed(record_id, success=False)
-            error_count += 1
+            
+            async with state_lock:
+                results.append(result_record)
+                error_count += 1
+                processed_count += 1
+            
+            await checkpoint_mgr.record_processed(record_id, success=False)
         
-        processed_count += 1
-        
-        # Progress update
-        if processed_count % 10 == 0 or processed_count == total_to_process:
-            elapsed = time.time() - start_time
-            rate = processed_count / elapsed if elapsed > 0 else 0
-            pct = processed_count / total_to_process * 100
-            
-            bar_width = 40
-            filled = int(bar_width * processed_count / total_to_process)
-            bar = "█" * filled + "░" * (bar_width - filled)
-            
-            eta = (total_to_process - processed_count) / rate if rate > 0 else 0
-            eta_str = f"{int(eta//60):02d}:{int(eta%60):02d}"
-            elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
-            
-            print(
-                f"\r   {pct:5.1f}% |{bar}| {processed_count}/{total_to_process} "
-                f"[{elapsed_str}<{eta_str}] ✓{success_count} ✗{error_count} "
-                f"FP:{len(false_positives)} ({rate:.1f}/s)",
-                end="", flush=True
-            )
+        return result_record
     
-    # Run async enrichment
+    def print_progress():
+        """Print progress bar."""
+        elapsed = time.time() - start_time
+        rate = processed_count / elapsed if elapsed > 0 else 0
+        pct = processed_count / total_to_process * 100 if total_to_process > 0 else 0
+        
+        bar_width = 40
+        filled = int(bar_width * processed_count / total_to_process) if total_to_process > 0 else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+        
+        eta = (total_to_process - processed_count) / rate if rate > 0 else 0
+        eta_str = f"{int(eta//60):02d}:{int(eta%60):02d}"
+        elapsed_str = f"{int(elapsed//60):02d}:{int(elapsed%60):02d}"
+        
+        print(
+            f"\r   {pct:5.1f}% |{bar}| {processed_count}/{total_to_process} "
+            f"[{elapsed_str}<{eta_str}] ✓{success_count} ✗{error_count} "
+            f"FP:{len(false_positives)} ({rate:.1f}/s)",
+            end="", flush=True
+        )
+    
+    # Run async enrichment with parallel result processing
     if not match_only and batch:
         import aiohttp
         
         async with aiohttp.ClientSession() as session:
-            tasks = [
+            # Create all enrichment tasks
+            enrichment_tasks = [
                 enricher.enrich_profile(session, record_id, url)
                 for record_id, url in batch
             ]
             
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                await process_result(result)
+            # Process results as they complete, spawning matching tasks in parallel
+            pending_match_tasks = set()
+            last_progress_update = 0
+            
+            for coro in asyncio.as_completed(enrichment_tasks):
+                enrichment_result = await coro
+                
+                # Create a matching task (runs in parallel with other matching)
+                match_task = asyncio.create_task(process_single_result(enrichment_result))
+                pending_match_tasks.add(match_task)
+                match_task.add_done_callback(pending_match_tasks.discard)
+                
+                # Update progress periodically
+                current_count = processed_count
+                if current_count - last_progress_update >= 10 or current_count == total_to_process:
+                    print_progress()
+                    last_progress_update = current_count
+            
+            # Wait for all remaining matching tasks to complete
+            if pending_match_tasks:
+                await asyncio.gather(*pending_match_tasks, return_exceptions=True)
+            
+            # Final progress update
+            print_progress()
     
     print()  # Newline after progress bar
     
     # Force final checkpoint save
-    checkpoint_mgr.save_checkpoint(force=True)
+    await checkpoint_mgr.save_checkpoint(force=True)
     
     elapsed_time = time.time() - start_time
     

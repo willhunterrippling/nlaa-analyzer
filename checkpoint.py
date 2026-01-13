@@ -8,6 +8,7 @@ Stores:
 - Current position in the dataset
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -16,6 +17,12 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+
+try:
+    import aiofiles
+    AIOFILES_AVAILABLE = True
+except ImportError:
+    AIOFILES_AVAILABLE = False
 
 
 @dataclass
@@ -277,6 +284,190 @@ class CheckpointManager:
         if self.cache_file.exists():
             self.cache_file.unlink()
         # Also clean up legacy cache if it exists
+        if self._legacy_cache_file.exists():
+            self._legacy_cache_file.unlink()
+        self.state = CheckpointState()
+        self.enrichment_cache = {}
+        self._pending_cache_writes = []
+
+
+class AsyncCheckpointManager:
+    """
+    Async checkpoint manager for non-blocking file I/O.
+    Uses aiofiles for async file operations.
+    """
+    
+    def __init__(
+        self,
+        checkpoint_dir: str = "checkpoints",
+        checkpoint_file: str = "checkpoint.json",
+        cache_file: str = "enrichment_cache.jsonl",
+        checkpoint_interval: int = 100
+    ):
+        if not AIOFILES_AVAILABLE:
+            raise ImportError("aiofiles is required for AsyncCheckpointManager. Install with: pip install aiofiles")
+        
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_file = self.checkpoint_dir / checkpoint_file
+        self.cache_file = self.checkpoint_dir / cache_file
+        self._legacy_cache_file = self.checkpoint_dir / "enrichment_cache.json"
+        self.checkpoint_interval = checkpoint_interval
+        
+        # State
+        self.state = CheckpointState()
+        self.enrichment_cache: dict[str, Any] = {}
+        
+        # Track pending cache writes
+        self._pending_cache_writes: list[tuple[str, dict]] = []
+        
+        # Ensure checkpoint directory exists
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Track when to save
+        self._records_since_checkpoint = 0
+        
+        # Lock for thread-safe operations
+        self._lock = asyncio.Lock()
+    
+    def initialize(self, input_file: str, total_records: int):
+        """Initialize a new checkpoint session."""
+        self.state = CheckpointState(
+            total_records=total_records,
+            started_at=datetime.now().isoformat(),
+            input_file=input_file
+        )
+        self._records_since_checkpoint = 0
+        self._pending_cache_writes = []
+    
+    async def _load_jsonl_cache_async(self) -> dict[str, Any]:
+        """Load cache from JSONL file asynchronously."""
+        cache = {}
+        if not self.cache_file.exists():
+            return cache
+        
+        async with aiofiles.open(self.cache_file, 'r') as f:
+            line_num = 0
+            async for line in f:
+                line_num += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    cache[entry["id"]] = entry["data"]
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"  Warning: Skipping malformed cache line {line_num}: {e}")
+        
+        return cache
+    
+    async def load_checkpoint(self) -> bool:
+        """
+        Load existing checkpoint if available (async).
+        Returns True if checkpoint was loaded, False otherwise.
+        """
+        if not self.checkpoint_file.exists():
+            return False
+        
+        try:
+            async with aiofiles.open(self.checkpoint_file, 'r') as f:
+                content = await f.read()
+            data = json.loads(content)
+            self.state = CheckpointState.from_dict(data)
+            
+            # Load enrichment cache from JSONL
+            self.enrichment_cache = await self._load_jsonl_cache_async()
+            
+            # Clear pending writes since we just loaded
+            self._pending_cache_writes = []
+            
+            return True
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"Warning: Failed to load checkpoint: {e}")
+            return False
+    
+    async def save_checkpoint(self, force: bool = False):
+        """
+        Save current state to checkpoint file (async).
+        Only saves if interval reached or force=True.
+        """
+        if not force and self._records_since_checkpoint < self.checkpoint_interval:
+            return
+        
+        async with self._lock:
+            self.state.last_checkpoint_at = datetime.now().isoformat()
+            
+            # Save checkpoint state
+            checkpoint_data = json.dumps(self.state.to_dict(), indent=2)
+            async with aiofiles.open(self.checkpoint_file, 'w') as f:
+                await f.write(checkpoint_data)
+            
+            # Append only new cache entries
+            if self._pending_cache_writes:
+                async with aiofiles.open(self.cache_file, 'a') as f:
+                    for record_id, data in self._pending_cache_writes:
+                        line = json.dumps({"id": record_id, "data": data})
+                        await f.write(line + '\n')
+                self._pending_cache_writes = []
+            
+            self._records_since_checkpoint = 0
+    
+    async def record_processed(
+        self,
+        record_id: str,
+        success: bool,
+        enriched_data: Optional[dict] = None,
+        skipped: bool = False
+    ):
+        """Record that a record was processed (async)."""
+        async with self._lock:
+            self.state.processed_ids.add(record_id)
+            self.state.last_processed_index += 1
+            self._records_since_checkpoint += 1
+            
+            if skipped:
+                self.state.skipped_count += 1
+            elif success:
+                self.state.success_count += 1
+                if enriched_data:
+                    self.enrichment_cache[record_id] = enriched_data
+                    self._pending_cache_writes.append((record_id, enriched_data))
+            else:
+                self.state.error_count += 1
+        
+        # Auto-save at intervals (outside lock)
+        await self.save_checkpoint()
+    
+    def is_processed(self, record_id: str) -> bool:
+        """Check if a record has already been processed."""
+        return record_id in self.state.processed_ids
+    
+    def get_cached_enrichment(self, record_id: str) -> Optional[dict]:
+        """Get cached enrichment data for a record."""
+        return self.enrichment_cache.get(record_id)
+    
+    def get_progress(self) -> dict:
+        """Get current progress statistics."""
+        processed = len(self.state.processed_ids)
+        total = self.state.total_records
+        pct = (processed / total * 100) if total > 0 else 0
+        
+        return {
+            "processed": processed,
+            "total": total,
+            "percent": pct,
+            "success": self.state.success_count,
+            "errors": self.state.error_count,
+            "skipped": self.state.skipped_count,
+            "started_at": self.state.started_at,
+            "last_checkpoint": self.state.last_checkpoint_at,
+        }
+    
+    def clear_checkpoint(self):
+        """Remove checkpoint files (start fresh)."""
+        if self.checkpoint_file.exists():
+            self.checkpoint_file.unlink()
+        if self.cache_file.exists():
+            self.cache_file.unlink()
         if self._legacy_cache_file.exists():
             self._legacy_cache_file.unlink()
         self.state = CheckpointState()
