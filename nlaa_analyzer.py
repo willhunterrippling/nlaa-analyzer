@@ -38,8 +38,8 @@ import re
 from url_normalizer import normalize_linkedin_url, NormalizationResult
 from checkpoint import CheckpointManager
 from enrichment import MixRankEnricher, ProgressTracker
-from matching import HybridMatcher, MatchConfidence, MatchResult
-from snowflake_enrichment import SnowflakeEnricher
+from matching import HybridMatcher, AsyncHybridMatcher, MatchConfidence, MatchResult
+from snowflake_enrichment import SnowflakeEnricher, HybridEnricher, AsyncHybridEnricher
 
 
 def load_cached_ids_fast(cache_file: str, show_progress: bool = True) -> set[str]:
@@ -152,7 +152,8 @@ def run_analysis(
     use_llm: bool = True,
     llm_model: str = "gpt-5-mini",
     use_snowflake: bool = False,
-    snowflake_batch_size: int = 10000
+    snowflake_batch_size: int = 10000,
+    mixrank_fallback: bool = True,
 ):
     """
     Main analysis pipeline.
@@ -252,14 +253,25 @@ def run_analysis(
     # Initialize enricher (lazy for Snowflake - only connect if needed)
     enricher = None
     snowflake_initialized = False
+    is_async_enricher = False
     
-    def get_snowflake_enricher():
-        nonlocal enricher, snowflake_initialized
+    def get_hybrid_enricher():
+        nonlocal enricher, snowflake_initialized, is_async_enricher
         if snowflake_initialized:
             return enricher
-        print(f"\n🔗 Initializing Snowflake enricher (batch size: {snowflake_batch_size})")
+        
+        fallback_msg = "with async MixRank fallback (50 concurrent)" if mixrank_fallback else "Snowflake only"
+        print(f"\n🔗 Initializing async hybrid enricher ({fallback_msg})")
+        print(f"   Snowflake batch size: {snowflake_batch_size}")
+        
         try:
-            enricher = SnowflakeEnricher(batch_size=snowflake_batch_size)
+            # Use async enricher for concurrent MixRank calls
+            enricher = AsyncHybridEnricher(
+                snowflake_batch_size=snowflake_batch_size,
+                mixrank_max_concurrent=50,  # MixRank allows up to 100
+                enable_mixrank_fallback=mixrank_fallback,
+            )
+            is_async_enricher = True
             success, msg = enricher.test_connection()
             if success:
                 print(f"   ✓ {msg}")
@@ -277,12 +289,12 @@ def run_analysis(
             # Check if we need Snowflake at all (skip if all records cached)
             uncached_count = sum(1 for r in valid_records if r.get('ID', '') not in cached_record_ids)
             if uncached_count > 0:
-                print(f"\n🔗 {uncached_count:,} records need Snowflake enrichment")
-                enricher = get_snowflake_enricher()
+                print(f"\n🔗 {uncached_count:,} records need enrichment")
+                enricher = get_hybrid_enricher()
                 if not enricher:
                     print("   ✗ Failed to connect - will use cache only")
             else:
-                print(f"\n✓ All {len(valid_records):,} records found in cache - Snowflake not needed")
+                print(f"\n✓ All {len(valid_records):,} records found in cache - enrichment not needed")
         else:
             print(f"\n🔗 Initializing MixRank enricher (rate: {rate_limit} req/sec)")
             try:
@@ -291,9 +303,9 @@ def run_analysis(
                 print(f"   ✗ Error: {e}")
                 sys.exit(1)
     
-    # Initialize matcher
+    # Initialize matcher (use async for LLM calls)
     print(f"\n🎯 Initializing matcher (LLM: {'enabled' if use_llm else 'disabled'})")
-    matcher = HybridMatcher(use_llm=use_llm, model=llm_model)
+    matcher = AsyncHybridMatcher(use_llm=use_llm, model=llm_model) if use_llm else HybridMatcher(use_llm=False)
     
     # Process records
     print(f"\n{'=' * 70}")
@@ -304,148 +316,201 @@ def run_analysis(
     false_positives = []
     ambiguous_cases = []
     
-    # Progress tracker
-    tracker = ProgressTracker(
-        total=len(valid_records),
-        description="Enriching & Matching",
-        update_interval=1 if test_mode else 10,
-        verbose=verbose
-    )
+    # ============================================================
+    # PHASE 1: Batch enrichment for uncached records
+    # ============================================================
+    # Collect all URLs that need enrichment (not in cache)
+    urls_to_enrich = {}
+    records_from_cache = {}
     
     for i, record in enumerate(valid_records):
         record_id = record.get('ID', f'row_{i}')
-        account_name = record.get('ACCOUNT_NAME', '')
         linkedin_url = record.get('_normalized_url', '')
         
-        # Skip if already processed (resume mode)
-        if checkpoint_mgr.is_processed(record_id):
-            cached = checkpoint_mgr.get_cached_enrichment(record_id)
-            if cached:
-                # Re-run matching on cached data
-                experiences = cached.get('experience', [])
-                match_result = matcher.match(account_name, experiences)
-                
-                if match_result.matched:
-                    false_positives.append({
-                        **record,
-                        **format_experience_for_output(match_result.matching_experience),
-                        'match_confidence': match_result.confidence.value,
-                        'match_reason': match_result.match_reason,
-                    })
-            
-            tracker.update(success=True, skipped=True, message=f"[CACHED] {record_id}")
-            continue
+        if record_id in cached_record_ids:
+            # Will use cache
+            records_from_cache[record_id] = True
+        elif not match_only and use_snowflake and linkedin_url:
+            # Need enrichment
+            urls_to_enrich[linkedin_url] = record_id
+    
+    # Batch enrich all uncached URLs
+    enrichment_results = {}
+    if urls_to_enrich and enricher:
+        print(f"\n📊 Batch enriching {len(urls_to_enrich):,} uncached URLs...")
         
-        # Enrich profile
+        if is_async_enricher:
+            # Run async enricher
+            import asyncio
+            enrichment_results = asyncio.run(enricher.enrich_batch(urls_to_enrich))
+        else:
+            # Sync enricher
+            enrichment_results = enricher.enrich_batch(urls_to_enrich)
+        
+        print(f"   ✓ Enrichment complete")
+    
+    # ============================================================
+    # PHASE 2: Gather enrichment data for all records
+    # ============================================================
+    print("\n📦 Gathering enrichment data...")
+    records_to_match = []  # List of (record, enriched_data)
+    enrichment_failures = []  # Track failed enrichments
+    
+    for i, record in enumerate(valid_records):
+        record_id = record.get('ID', f'row_{i}')
+        linkedin_url = record.get('_normalized_url', '')
+        
+        # Get enrichment data from various sources
         enriched_data = None
         enrichment_error = None
         
-        # First check if record is already in cache (even if not in checkpoint.json)
+        # Check cache first
         if record_id in cached_record_ids:
             enriched_data = checkpoint_mgr.get_cached_enrichment(record_id)
-            if enriched_data:
-                # Use cached data, skip enrichment
-                pass  # enriched_data is already set
-            else:
-                # ID was in cache scan but data not found (shouldn't happen)
-                tracker.update(success=False, message=f"Cache mismatch for {record_id}")
-                continue
         elif match_only:
-            # Try to get from cache
             enriched_data = checkpoint_mgr.get_cached_enrichment(record_id)
-            if not enriched_data:
-                tracker.update(success=False, message=f"No cached data for {record_id}")
-                continue
         elif use_snowflake:
-            # Query Snowflake (single record - for batching see below)
-            url_to_id = {linkedin_url: record_id}
-            sf_results = enricher.enrich_batch(url_to_id)
-            enrich_result = sf_results.get(linkedin_url)
-            
+            # Get from pre-fetched results
+            enrich_result = enrichment_results.get(linkedin_url)
             if enrich_result and enrich_result.success:
                 enriched_data = enrich_result.data
-            else:
-                enrichment_error = enrich_result.error if enrich_result else "Snowflake lookup failed"
+            elif enrich_result:
+                enrichment_error = enrich_result.error
         else:
-            # Call MixRank API
+            # Direct MixRank API call (sync) - only for non-batched fallback
             enrich_result = enricher.enrich_profile(linkedin_url)
-            
             if enrich_result.success:
                 enriched_data = enrich_result.data
             else:
                 enrichment_error = enrich_result.error
         
-        # Process result
         if enriched_data:
+            records_to_match.append((record, enriched_data))
+        elif enrichment_error:
+            # Track failures
+            enrichment_failures.append({
+                **record,
+                'enrichment_success': False,
+                'enrichment_error': enrichment_error,
+            })
+    
+    print(f"   ✓ {len(records_to_match)} records ready for matching")
+    if enrichment_failures:
+        print(f"   ⚠ {len(enrichment_failures)} records failed enrichment")
+    
+    # ============================================================
+    # PHASE 3: Batch matching with async LLM calls
+    # ============================================================
+    import asyncio
+    
+    async def batch_match_all():
+        """Run all matching in a single async batch for efficiency."""
+        match_tasks = []
+        
+        for record, enriched_data in records_to_match:
+            account_name = record.get('ACCOUNT_NAME', '')
             experiences = enriched_data.get('experience', [])
             
-            # Match account name to experiences
-            match_result = matcher.match(account_name, experiences)
+            if use_llm:
+                # Create async task for each match
+                match_tasks.append(matcher.match(account_name, experiences))
+            else:
+                # Sync matching doesn't need async
+                match_tasks.append(asyncio.coroutine(lambda r=matcher.match(account_name, experiences): r)())
+        
+        if use_llm:
+            # Run all LLM calls concurrently
+            return await asyncio.gather(*match_tasks)
+        else:
+            # For sync matching, just run sequentially
+            return [matcher.match(r.get('ACCOUNT_NAME', ''), e.get('experience', [])) 
+                    for r, e in records_to_match]
+    
+    print("\n🎯 Running batch matching...")
+    match_start = time.time()
+    
+    if use_llm:
+        match_results = asyncio.run(batch_match_all())
+    else:
+        match_results = [matcher.match(r.get('ACCOUNT_NAME', ''), e.get('experience', [])) 
+                        for r, e in records_to_match]
+    
+    match_elapsed = time.time() - match_start
+    print(f"   ✓ Matching complete in {match_elapsed:.1f}s ({len(match_results)/max(match_elapsed, 0.1):.1f} records/sec)")
+    
+    # ============================================================
+    # PHASE 4: Process match results
+    # ============================================================
+    tracker = ProgressTracker(
+        total=len(records_to_match),
+        description="Processing",
+        update_interval=1 if test_mode else 10,
+        verbose=verbose
+    )
+    
+    for i, ((record, enriched_data), match_result) in enumerate(zip(records_to_match, match_results)):
+        record_id = record.get('ID', f'row_{i}')
+        account_name = record.get('ACCOUNT_NAME', '')
+        experiences = enriched_data.get('experience', [])
+        
+        # Build result record
+        result_record = {
+            **record,
+            'enrichment_success': True,
+            'experience_count': len(experiences),
+            'current_experience_count': len([e for e in experiences if e.get('is_current') or e.get('end_date') is None]),
+            'matched': match_result.matched,
+            'match_confidence': match_result.confidence.value,
+            'match_reason': match_result.match_reason,
+            'all_current_companies': ', '.join(c for c in match_result.all_current_companies if c),
+            **format_experience_for_output(match_result.matching_experience),
+        }
+        
+        results.append(result_record)
+        
+        # Categorize
+        if match_result.matched:
+            false_positives.append(result_record)
             
-            # Build result record
-            result_record = {
-                **record,
-                'enrichment_success': True,
-                'experience_count': len(experiences),
-                'current_experience_count': len([e for e in experiences if e.get('is_current') or e.get('end_date') is None]),
-                'matched': match_result.matched,
-                'match_confidence': match_result.confidence.value,
-                'match_reason': match_result.match_reason,
-                'all_current_companies': ', '.join(c for c in match_result.all_current_companies if c),
-                **format_experience_for_output(match_result.matching_experience),
-            }
-            
-            results.append(result_record)
-            
-            # Categorize
-            if match_result.matched:
-                false_positives.append(result_record)
-                
-                if verbose:
-                    print(f"\n   ✓ FALSE POSITIVE FOUND:")
-                    print(f"     ID: {record_id}")
-                    print(f"     Account: {account_name}")
-                    print(f"     Matched: {match_result.matching_experience.get('company', 'N/A')}")
-                    print(f"     Confidence: {match_result.confidence.value}")
-                    print(f"     Reason: {match_result.match_reason}")
-            
-            elif match_result.confidence == MatchConfidence.LOW:
-                ambiguous_cases.append(result_record)
-            
-            # Record checkpoint
+            if verbose:
+                print(f"\n   ✓ FALSE POSITIVE FOUND:")
+                print(f"     ID: {record_id}")
+                print(f"     Account: {account_name}")
+                print(f"     Matched: {match_result.matching_experience.get('company', 'N/A')}")
+                print(f"     Confidence: {match_result.confidence.value}")
+                print(f"     Reason: {match_result.match_reason}")
+        
+        elif match_result.confidence == MatchConfidence.LOW:
+            ambiguous_cases.append(result_record)
+        
+        # Record checkpoint (only for new records not already in cache)
+        if record_id not in cached_record_ids:
             checkpoint_mgr.record_processed(
                 record_id=record_id,
                 success=True,
                 enriched_data=enriched_data
             )
-            
-            tracker.update(
-                success=True,
-                message=f"{'✓ MATCH' if match_result.matched else '✗ No match'}: {account_name[:30]}"
-            )
         
-        else:
-            # Enrichment failed
-            result_record = {
-                **record,
-                'enrichment_success': False,
-                'enrichment_error': enrichment_error,
-            }
-            results.append(result_record)
-            
-            checkpoint_mgr.record_processed(
-                record_id=record_id,
-                success=False
-            )
-            
-            tracker.update(
-                success=False,
-                message=f"Enrichment failed: {enrichment_error[:50] if enrichment_error else 'Unknown'}"
-            )
+        tracker.update(
+            success=True,
+            message=f"{'✓ MATCH' if match_result.matched else '✗ No match'}: {account_name[:30]}"
+        )
     
     # Force final checkpoint save
     checkpoint_mgr.save_checkpoint(force=True)
     tracker.finish()
+    
+    # Add enrichment failures to results
+    results.extend(enrichment_failures)
+    
+    # Export URLs not found in Snowflake (if using hybrid enricher)
+    snowflake_missing_count = 0
+    if use_snowflake and enricher and hasattr(enricher, 'export_snowflake_missing'):
+        enricher.print_stats()
+        snowflake_missing_file = output_path / f"snowflake_missing_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        snowflake_missing_count = enricher.export_snowflake_missing(str(snowflake_missing_file))
+        if snowflake_missing_count > 0:
+            print(f"\n💾 Exported {snowflake_missing_count:,} URLs not found in Snowflake: {snowflake_missing_file}")
     
     # Calculate elapsed time
     elapsed_time = time.time() - tracker.start_time
@@ -528,6 +593,7 @@ def run_analysis(
         'false_positives': len(false_positives),
         'ambiguous': len(ambiguous_cases),
         'skipped': len(skipped_records),
+        'snowflake_missing': snowflake_missing_count,
     }
 
 
@@ -794,13 +860,18 @@ Examples:
     parser.add_argument(
         '--snowflake',
         action='store_true',
-        help='Use Snowflake for enrichment instead of MixRank API'
+        help='Use Snowflake for enrichment (with MixRank API fallback for missing data)'
     )
     parser.add_argument(
         '--snowflake-batch-size',
         type=int,
         default=10000,
         help='Batch size for Snowflake queries (default: 10000)'
+    )
+    parser.add_argument(
+        '--no-mixrank-fallback',
+        action='store_true',
+        help='Disable MixRank API fallback when using Snowflake (Snowflake only)'
     )
     
     args = parser.parse_args()
@@ -831,7 +902,8 @@ Examples:
             use_llm=not args.no_llm,
             llm_model=args.llm_model,
             use_snowflake=args.snowflake,
-            snowflake_batch_size=args.snowflake_batch_size
+            snowflake_batch_size=args.snowflake_batch_size,
+            mixrank_fallback=not args.no_mixrank_fallback,
         )
         
         # Exit code based on results

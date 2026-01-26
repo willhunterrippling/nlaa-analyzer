@@ -7,12 +7,14 @@ Handles API calls to MixRank with:
 - Progress tracking with rich output
 """
 
+import asyncio
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+import aiohttp
 import requests
 from dotenv import load_dotenv
 
@@ -209,6 +211,173 @@ class MixRankEnricher:
                     success=False,
                     error=f"Request error: {str(e)}"
                 )
+    
+    def get_stats(self) -> dict:
+        """Get current statistics."""
+        return self.stats.copy()
+
+
+class AsyncMixRankEnricher:
+    """
+    Async MixRank API client with concurrent requests.
+    
+    MixRank allows up to 100 concurrent requests.
+    Default is 50 for safety margin.
+    """
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        max_concurrent: int = 50,
+        timeout: int = 30
+    ):
+        import aiohttp
+        
+        self.api_key = api_key or os.environ.get("MIXRANK_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "MixRank API key required. Set MIXRANK_API_KEY env var or pass api_key parameter."
+            )
+        
+        self.base_url = f"https://api.mixrank.com/v2/json/{self.api_key}/linkedin/profile"
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.max_concurrent = max_concurrent
+        self._semaphore = None  # Created in async context
+        self._session = None
+        
+        # Statistics
+        self.stats = {
+            "total_requests": 0,
+            "successful": 0,
+            "failed": 0,
+            "retries": 0,
+        }
+    
+    async def _get_session(self):
+        """Get or create aiohttp session."""
+        import aiohttp
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=self.timeout)
+        return self._session
+    
+    async def _get_semaphore(self):
+        """Get or create semaphore for concurrency control."""
+        import asyncio
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        return self._semaphore
+    
+    async def enrich_profile(self, linkedin_url: str) -> EnrichmentResult:
+        """Enrich a single LinkedIn profile asynchronously."""
+        import aiohttp
+        
+        semaphore = await self._get_semaphore()
+        session = await self._get_session()
+        
+        self.stats["total_requests"] += 1
+        
+        async with semaphore:
+            retries = 0
+            max_retries = 3
+            delay = 1.0
+            
+            while retries <= max_retries:
+                try:
+                    async with session.get(
+                        self.base_url,
+                        params={"url": linkedin_url}
+                    ) as response:
+                        if response.status == 200:
+                            self.stats["successful"] += 1
+                            data = await response.json()
+                            return EnrichmentResult(
+                                linkedin_url=linkedin_url,
+                                success=True,
+                                data=data,
+                                http_status=200
+                            )
+                        
+                        # Rate limited or server error - retry
+                        if response.status in (429, 500, 502, 503, 504):
+                            if retries < max_retries:
+                                retries += 1
+                                self.stats["retries"] += 1
+                                await asyncio.sleep(delay)
+                                delay *= 2
+                                continue
+                        
+                        # Client error - don't retry
+                        self.stats["failed"] += 1
+                        text = await response.text()
+                        return EnrichmentResult(
+                            linkedin_url=linkedin_url,
+                            success=False,
+                            error=f"HTTP {response.status}: {text[:200]}",
+                            http_status=response.status
+                        )
+                        
+                except asyncio.TimeoutError:
+                    if retries < max_retries:
+                        retries += 1
+                        self.stats["retries"] += 1
+                        await asyncio.sleep(delay)
+                        delay *= 2
+                        continue
+                    self.stats["failed"] += 1
+                    return EnrichmentResult(
+                        linkedin_url=linkedin_url,
+                        success=False,
+                        error="Request timeout - max retries exceeded"
+                    )
+                    
+                except aiohttp.ClientError as e:
+                    self.stats["failed"] += 1
+                    return EnrichmentResult(
+                        linkedin_url=linkedin_url,
+                        success=False,
+                        error=f"Request error: {str(e)}"
+                    )
+            
+            # Exhausted retries
+            self.stats["failed"] += 1
+            return EnrichmentResult(
+                linkedin_url=linkedin_url,
+                success=False,
+                error="Max retries exceeded"
+            )
+    
+    async def enrich_batch(self, urls: list[str]) -> dict[str, EnrichmentResult]:
+        """
+        Enrich multiple profiles concurrently.
+        
+        Args:
+            urls: List of LinkedIn URLs
+            
+        Returns:
+            Dict mapping URL to EnrichmentResult
+        """
+        import asyncio
+        
+        tasks = [self.enrich_profile(url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        output = {}
+        for url, result in zip(urls, results):
+            if isinstance(result, Exception):
+                output[url] = EnrichmentResult(
+                    linkedin_url=url,
+                    success=False,
+                    error=str(result)
+                )
+            else:
+                output[url] = result
+        
+        return output
+    
+    async def close(self):
+        """Close the aiohttp session."""
+        if self._session and not self._session.closed:
+            await self._session.close()
     
     def get_stats(self) -> dict:
         """Get current statistics."""

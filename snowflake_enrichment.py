@@ -338,6 +338,497 @@ class SnowflakeEnricher:
             return False, f"Connection failed: {str(e)}"
 
 
+class HybridEnricher:
+    """
+    Hybrid enricher that tries Snowflake first, falls back to MixRank API.
+    
+    Strategy:
+    1. Query Snowflake in batch (fast, free)
+    2. For records with no Snowflake data, fall back to MixRank API (slower, costly)
+    3. Track stats for both sources
+    
+    This gives ~85-90% cost savings while maintaining full coverage.
+    """
+    
+    def __init__(
+        self,
+        snowflake_batch_size: int = 10000,
+        mixrank_rate_limit: float = 2.0,
+        enable_mixrank_fallback: bool = True,
+    ):
+        """
+        Initialize hybrid enricher with both Snowflake and MixRank.
+        
+        Args:
+            snowflake_batch_size: Batch size for Snowflake queries
+            mixrank_rate_limit: Rate limit for MixRank API (requests per second)
+            enable_mixrank_fallback: If False, skip MixRank and just report missing
+        """
+        from enrichment import MixRankEnricher
+        
+        self.snowflake_enricher = SnowflakeEnricher(batch_size=snowflake_batch_size)
+        self.enable_mixrank_fallback = enable_mixrank_fallback
+        self.mixrank_enricher = None
+        
+        if enable_mixrank_fallback:
+            try:
+                self.mixrank_enricher = MixRankEnricher(requests_per_second=mixrank_rate_limit)
+            except ValueError as e:
+                print(f"   ⚠ MixRank fallback disabled: {e}")
+                self.enable_mixrank_fallback = False
+        
+        self.stats = {
+            "total_urls": 0,
+            "snowflake_found": 0,
+            "snowflake_missing": 0,
+            "mixrank_called": 0,
+            "mixrank_success": 0,
+            "mixrank_failed": 0,
+            "total_success": 0,
+            "total_failed": 0,
+        }
+        
+        # Track URLs not found in Snowflake (had to use MixRank fallback)
+        self.snowflake_missing_urls: list[dict] = []
+    
+    def test_connection(self) -> tuple[bool, str]:
+        """Test connections to both Snowflake and MixRank."""
+        sf_success, sf_msg = self.snowflake_enricher.test_connection()
+        
+        if not sf_success:
+            return False, f"Snowflake: {sf_msg}"
+        
+        result_msg = f"Snowflake: {sf_msg}"
+        
+        if self.enable_mixrank_fallback:
+            result_msg += " | MixRank fallback: enabled"
+        else:
+            result_msg += " | MixRank fallback: disabled"
+        
+        return True, result_msg
+    
+    def enrich_batch(self, url_to_id: dict[str, str]) -> dict[str, EnrichmentResult]:
+        """
+        Enrich a batch of URLs using Snowflake first, MixRank fallback for missing.
+        
+        Args:
+            url_to_id: Mapping of LinkedIn URLs to record IDs
+            
+        Returns:
+            Dict mapping original URLs to EnrichmentResults
+        """
+        if not url_to_id:
+            return {}
+        
+        self.stats["total_urls"] += len(url_to_id)
+        results = {}
+        
+        # Step 1: Query Snowflake for all URLs
+        sf_results = self.snowflake_enricher.enrich_batch(url_to_id)
+        
+        # Separate successes from failures
+        missing_urls = {}
+        for url, result in sf_results.items():
+            if result.success and result.data and result.data.get('experience'):
+                # Snowflake has data
+                results[url] = result
+                self.stats["snowflake_found"] += 1
+            else:
+                # Snowflake missing - need fallback
+                missing_urls[url] = url_to_id.get(url, url)
+                self.stats["snowflake_missing"] += 1
+        
+        # Step 2: Fall back to MixRank for missing URLs
+        if missing_urls and self.enable_mixrank_fallback and self.mixrank_enricher:
+            print(f"   📡 Falling back to MixRank API for {len(missing_urls)} URLs...")
+            
+            for url in missing_urls:
+                record_id = url_to_id.get(url, url)
+                self.stats["mixrank_called"] += 1
+                
+                try:
+                    mr_result = self.mixrank_enricher.enrich_profile(url)
+                    
+                    # Convert MixRank result to our format (they should be compatible)
+                    results[url] = EnrichmentResult(
+                        linkedin_url=url,
+                        success=mr_result.success,
+                        data=mr_result.data,
+                        error=mr_result.error,
+                        http_status=mr_result.http_status,
+                    )
+                    
+                    if mr_result.success:
+                        self.stats["mixrank_success"] += 1
+                        # Track this URL as missing from Snowflake (but found via MixRank)
+                        self.snowflake_missing_urls.append({
+                            'record_id': record_id,
+                            'linkedin_url': url,
+                            'source': 'mixrank_api',
+                            'mixrank_success': True,
+                        })
+                    else:
+                        self.stats["mixrank_failed"] += 1
+                        # Track this URL as missing from both sources
+                        self.snowflake_missing_urls.append({
+                            'record_id': record_id,
+                            'linkedin_url': url,
+                            'source': 'mixrank_api',
+                            'mixrank_success': False,
+                            'mixrank_error': mr_result.error,
+                        })
+                        
+                except Exception as e:
+                    results[url] = EnrichmentResult(
+                        linkedin_url=url,
+                        success=False,
+                        error=f"MixRank error: {str(e)}",
+                    )
+                    self.stats["mixrank_failed"] += 1
+                    # Track this URL as missing from both sources
+                    self.snowflake_missing_urls.append({
+                        'record_id': record_id,
+                        'linkedin_url': url,
+                        'source': 'mixrank_api',
+                        'mixrank_success': False,
+                        'mixrank_error': str(e),
+                    })
+        else:
+            # No MixRank fallback - mark as failed
+            for url in missing_urls:
+                record_id = url_to_id.get(url, url)
+                results[url] = EnrichmentResult(
+                    linkedin_url=url,
+                    success=False,
+                    error="Not found in Snowflake (MixRank fallback disabled)",
+                )
+                # Track this URL as missing from Snowflake (no MixRank fallback)
+                self.snowflake_missing_urls.append({
+                    'record_id': record_id,
+                    'linkedin_url': url,
+                    'source': 'snowflake_only',
+                    'mixrank_success': False,
+                })
+        
+        # Update totals
+        self.stats["total_success"] = self.stats["snowflake_found"] + self.stats["mixrank_success"]
+        self.stats["total_failed"] = self.stats["mixrank_failed"] + (
+            self.stats["snowflake_missing"] - self.stats["mixrank_called"]
+        )
+        
+        return results
+    
+    def enrich_profile(self, linkedin_url: str) -> EnrichmentResult:
+        """Enrich a single profile (convenience wrapper)."""
+        results = self.enrich_batch({linkedin_url: linkedin_url})
+        return results.get(linkedin_url, EnrichmentResult(
+            linkedin_url=linkedin_url,
+            success=False,
+            error="Unknown error",
+        ))
+    
+    def get_stats(self) -> dict:
+        """Get combined stats from both enrichers."""
+        stats = self.stats.copy()
+        stats["snowflake_stats"] = self.snowflake_enricher.get_stats()
+        if self.mixrank_enricher:
+            stats["mixrank_stats"] = {
+                "total_calls": self.stats["mixrank_called"],
+                "success": self.stats["mixrank_success"],
+                "failed": self.stats["mixrank_failed"],
+            }
+        return stats
+    
+    def close(self):
+        """Close connections."""
+        self.snowflake_enricher.close()
+    
+    def print_stats(self):
+        """Print a summary of enrichment sources."""
+        total = self.stats["total_urls"]
+        if total == 0:
+            return
+        
+        sf_found = self.stats["snowflake_found"]
+        sf_missing = self.stats["snowflake_missing"]
+        mr_success = self.stats["mixrank_success"]
+        mr_failed = self.stats["mixrank_failed"]
+        
+        print(f"\n📊 Enrichment Source Summary:")
+        print(f"   Total URLs: {total:,}")
+        print(f"   ✓ Snowflake: {sf_found:,} ({sf_found/total*100:.1f}%)")
+        if self.enable_mixrank_fallback:
+            print(f"   ✓ MixRank fallback: {mr_success:,} ({mr_success/total*100:.1f}%)")
+            print(f"   ✗ Failed: {mr_failed:,} ({mr_failed/total*100:.1f}%)")
+        else:
+            print(f"   ✗ Not in Snowflake: {sf_missing:,} ({sf_missing/total*100:.1f}%)")
+    
+    def get_snowflake_missing_urls(self) -> list[dict]:
+        """
+        Get list of URLs that were not found in Snowflake.
+        
+        Returns list of dicts with:
+        - record_id: The original record ID
+        - linkedin_url: The LinkedIn profile URL
+        - source: 'mixrank_api' or 'snowflake_only'
+        - mixrank_success: Whether MixRank API call succeeded (if applicable)
+        - mixrank_error: Error message if MixRank failed
+        """
+        return self.snowflake_missing_urls.copy()
+    
+    def export_snowflake_missing(self, filepath: str) -> int:
+        """
+        Export URLs not found in Snowflake to a CSV file.
+        
+        Args:
+            filepath: Path to output CSV file
+            
+        Returns:
+            Number of records exported
+        """
+        import csv
+        
+        if not self.snowflake_missing_urls:
+            return 0
+        
+        fieldnames = ['record_id', 'linkedin_url', 'source', 'mixrank_success', 'mixrank_error']
+        
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(self.snowflake_missing_urls)
+        
+        return len(self.snowflake_missing_urls)
+
+
+class AsyncHybridEnricher:
+    """
+    Async hybrid enricher with concurrent MixRank API calls.
+    
+    Strategy:
+    1. Query Snowflake in batch (fast, free)
+    2. For missing records, call MixRank API concurrently (up to 50 at a time)
+    3. Track stats from both sources
+    
+    With 50 concurrent MixRank requests, ~100k fallback URLs can be processed in ~30 min
+    instead of 15+ hours with sequential calls.
+    """
+    
+    def __init__(
+        self,
+        snowflake_batch_size: int = 10000,
+        mixrank_max_concurrent: int = 50,
+        enable_mixrank_fallback: bool = True,
+    ):
+        """
+        Initialize async hybrid enricher.
+        
+        Args:
+            snowflake_batch_size: Batch size for Snowflake queries
+            mixrank_max_concurrent: Max concurrent MixRank API calls (default 50, max 100)
+            enable_mixrank_fallback: If False, skip MixRank and just report missing
+        """
+        from enrichment import AsyncMixRankEnricher
+        
+        self.snowflake_enricher = SnowflakeEnricher(batch_size=snowflake_batch_size)
+        self.enable_mixrank_fallback = enable_mixrank_fallback
+        self.mixrank_enricher = None
+        self.mixrank_max_concurrent = min(mixrank_max_concurrent, 100)  # Cap at 100
+        
+        if enable_mixrank_fallback:
+            try:
+                self.mixrank_enricher = AsyncMixRankEnricher(
+                    max_concurrent=self.mixrank_max_concurrent
+                )
+            except ValueError as e:
+                print(f"   ⚠ MixRank fallback disabled: {e}")
+                self.enable_mixrank_fallback = False
+        
+        self.stats = {
+            "total_urls": 0,
+            "snowflake_found": 0,
+            "snowflake_missing": 0,
+            "mixrank_called": 0,
+            "mixrank_success": 0,
+            "mixrank_failed": 0,
+            "total_success": 0,
+            "total_failed": 0,
+        }
+        
+        self.snowflake_missing_urls: list[dict] = []
+    
+    def test_connection(self) -> tuple[bool, str]:
+        """Test Snowflake connection (MixRank tested on first use)."""
+        sf_success, sf_msg = self.snowflake_enricher.test_connection()
+        
+        if not sf_success:
+            return False, f"Snowflake: {sf_msg}"
+        
+        result_msg = f"Snowflake: {sf_msg}"
+        
+        if self.enable_mixrank_fallback:
+            result_msg += f" | MixRank: async ({self.mixrank_max_concurrent} concurrent)"
+        else:
+            result_msg += " | MixRank fallback: disabled"
+        
+        return True, result_msg
+    
+    async def enrich_batch(self, url_to_id: dict[str, str]) -> dict[str, EnrichmentResult]:
+        """
+        Enrich URLs using Snowflake first, then async MixRank fallback.
+        
+        Args:
+            url_to_id: Mapping of LinkedIn URLs to record IDs
+            
+        Returns:
+            Dict mapping original URLs to EnrichmentResults
+        """
+        import asyncio
+        
+        if not url_to_id:
+            return {}
+        
+        self.stats["total_urls"] += len(url_to_id)
+        results = {}
+        
+        # Step 1: Query Snowflake for all URLs (sync - it's already batched)
+        sf_results = self.snowflake_enricher.enrich_batch(url_to_id)
+        
+        # Separate successes from failures
+        missing_urls = {}
+        for url, result in sf_results.items():
+            if result.success and result.data and result.data.get('experience'):
+                results[url] = result
+                self.stats["snowflake_found"] += 1
+            else:
+                missing_urls[url] = url_to_id.get(url, url)
+                self.stats["snowflake_missing"] += 1
+        
+        # Step 2: Fall back to MixRank concurrently for missing URLs
+        if missing_urls and self.enable_mixrank_fallback and self.mixrank_enricher:
+            print(f"   📡 Async MixRank fallback for {len(missing_urls)} URLs ({self.mixrank_max_concurrent} concurrent)...")
+            
+            self.stats["mixrank_called"] += len(missing_urls)
+            
+            # Batch MixRank calls
+            mr_results = await self.mixrank_enricher.enrich_batch(list(missing_urls.keys()))
+            
+            for url, mr_result in mr_results.items():
+                record_id = url_to_id.get(url, url)
+                
+                results[url] = EnrichmentResult(
+                    linkedin_url=url,
+                    success=mr_result.success,
+                    data=mr_result.data,
+                    error=mr_result.error,
+                    http_status=mr_result.http_status,
+                )
+                
+                if mr_result.success:
+                    self.stats["mixrank_success"] += 1
+                    self.snowflake_missing_urls.append({
+                        'record_id': record_id,
+                        'linkedin_url': url,
+                        'source': 'mixrank_api',
+                        'mixrank_success': True,
+                    })
+                else:
+                    self.stats["mixrank_failed"] += 1
+                    self.snowflake_missing_urls.append({
+                        'record_id': record_id,
+                        'linkedin_url': url,
+                        'source': 'mixrank_api',
+                        'mixrank_success': False,
+                        'mixrank_error': mr_result.error,
+                    })
+        else:
+            # No MixRank fallback
+            for url in missing_urls:
+                record_id = url_to_id.get(url, url)
+                results[url] = EnrichmentResult(
+                    linkedin_url=url,
+                    success=False,
+                    error="Not found in Snowflake (MixRank fallback disabled)",
+                )
+                self.snowflake_missing_urls.append({
+                    'record_id': record_id,
+                    'linkedin_url': url,
+                    'source': 'snowflake_only',
+                    'mixrank_success': False,
+                })
+        
+        # Update totals
+        self.stats["total_success"] = self.stats["snowflake_found"] + self.stats["mixrank_success"]
+        self.stats["total_failed"] = self.stats["mixrank_failed"] + (
+            self.stats["snowflake_missing"] - self.stats["mixrank_called"]
+        )
+        
+        return results
+    
+    async def enrich_profile(self, linkedin_url: str) -> EnrichmentResult:
+        """Enrich a single profile."""
+        results = await self.enrich_batch({linkedin_url: linkedin_url})
+        return results.get(linkedin_url, EnrichmentResult(
+            linkedin_url=linkedin_url,
+            success=False,
+            error="Unknown error",
+        ))
+    
+    def get_stats(self) -> dict:
+        """Get combined stats."""
+        stats = self.stats.copy()
+        stats["snowflake_stats"] = self.snowflake_enricher.get_stats()
+        if self.mixrank_enricher:
+            stats["mixrank_stats"] = self.mixrank_enricher.get_stats()
+        return stats
+    
+    async def close(self):
+        """Close connections."""
+        self.snowflake_enricher.close()
+        if self.mixrank_enricher:
+            await self.mixrank_enricher.close()
+    
+    def print_stats(self):
+        """Print summary of enrichment sources."""
+        total = self.stats["total_urls"]
+        if total == 0:
+            return
+        
+        sf_found = self.stats["snowflake_found"]
+        sf_missing = self.stats["snowflake_missing"]
+        mr_success = self.stats["mixrank_success"]
+        mr_failed = self.stats["mixrank_failed"]
+        
+        print(f"\n📊 Enrichment Source Summary:")
+        print(f"   Total URLs: {total:,}")
+        print(f"   ✓ Snowflake: {sf_found:,} ({sf_found/total*100:.1f}%)")
+        if self.enable_mixrank_fallback:
+            print(f"   ✓ MixRank async: {mr_success:,} ({mr_success/total*100:.1f}%)")
+            print(f"   ✗ Failed: {mr_failed:,} ({mr_failed/total*100:.1f}%)")
+        else:
+            print(f"   ✗ Not in Snowflake: {sf_missing:,} ({sf_missing/total*100:.1f}%)")
+    
+    def get_snowflake_missing_urls(self) -> list[dict]:
+        """Get list of URLs not found in Snowflake."""
+        return self.snowflake_missing_urls.copy()
+    
+    def export_snowflake_missing(self, filepath: str) -> int:
+        """Export URLs not found in Snowflake to CSV."""
+        import csv
+        
+        if not self.snowflake_missing_urls:
+            return 0
+        
+        fieldnames = ['record_id', 'linkedin_url', 'source', 'mixrank_success', 'mixrank_error']
+        
+        with open(filepath, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(self.snowflake_missing_urls)
+        
+        return len(self.snowflake_missing_urls)
+
+
 # Testing
 if __name__ == "__main__":
     print("Snowflake Enrichment Module Test")
