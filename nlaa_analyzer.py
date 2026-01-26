@@ -33,10 +33,44 @@ from typing import Optional
 
 from dotenv import load_dotenv
 
+import re
+
 from url_normalizer import normalize_linkedin_url, NormalizationResult
 from checkpoint import CheckpointManager
 from enrichment import MixRankEnricher, ProgressTracker
 from matching import HybridMatcher, MatchConfidence, MatchResult
+from snowflake_enrichment import SnowflakeEnricher
+
+
+def load_cached_ids_fast(cache_file: str, show_progress: bool = True) -> set[str]:
+    """Fast scan of cache file to get all record IDs (without full JSON parse)."""
+    ids = set()
+    if not os.path.exists(cache_file):
+        return ids
+    
+    # Get file size for progress
+    file_size = os.path.getsize(cache_file)
+    bytes_read = 0
+    last_pct = -1
+    
+    with open(cache_file, 'r') as f:
+        for line in f:
+            bytes_read += len(line.encode('utf-8'))
+            # Fast extraction without full JSON parse
+            match = re.search(r'"id":\s*"([^"]+)"', line)
+            if match:
+                ids.add(match.group(1))
+            
+            # Progress update every 5%
+            if show_progress and file_size > 0:
+                pct = int(bytes_read / file_size * 100)
+                if pct >= last_pct + 5:
+                    print(f"\r   Scanning cache... {pct}% ({len(ids):,} records)", end="", flush=True)
+                    last_pct = pct
+    
+    if show_progress:
+        print()  # Newline after progress
+    return ids
 
 load_dotenv()
 
@@ -116,14 +150,16 @@ def run_analysis(
     checkpoint_interval: int = 100,
     rate_limit: float = 2.0,
     use_llm: bool = True,
-    llm_model: str = "gpt-5-mini"
+    llm_model: str = "gpt-5-mini",
+    use_snowflake: bool = False,
+    snowflake_batch_size: int = 10000
 ):
     """
     Main analysis pipeline.
     
     Steps:
     1. Load and preprocess data
-    2. Enrich via MixRank (with checkpointing)
+    2. Enrich via MixRank API or Snowflake (with checkpointing)
     3. Match account names to experiences
     4. Output results
     """
@@ -152,6 +188,23 @@ def run_analysis(
         else:
             print("\n⚠ No checkpoint found, starting fresh")
             resume = False
+    
+    # Load cached IDs from cache file (source of truth for what's already enriched)
+    cache_file = Path(CHECKPOINT_DIR) / "enrichment_cache.jsonl"
+    cached_record_ids = set()
+    if cache_file.exists():
+        cache_size_mb = cache_file.stat().st_size / (1024 * 1024)
+        print(f"\n📂 Loading enrichment cache ({cache_size_mb:.0f} MB)...")
+        import time as _time
+        _start = _time.time()
+        cached_record_ids = load_cached_ids_fast(str(cache_file))
+        print(f"   ✓ Scanned {len(cached_record_ids):,} record IDs ({_time.time()-_start:.1f}s)")
+        
+        # Ensure cache is loaded for data lookup (even if not formally resuming)
+        if cached_record_ids and not resume:
+            _start2 = _time.time()
+            checkpoint_mgr.enrichment_cache = checkpoint_mgr._load_jsonl_cache()
+            print(f"   ✓ Loaded full cache data ({_time.time()-_start2:.1f}s)")
     
     # Load data
     print(f"\n📂 Loading data from: {input_file}")
@@ -196,14 +249,47 @@ def run_analysis(
             if count > 0:
                 print(f"     - {issue}: {count}")
     
-    # Initialize enricher
-    if not match_only:
-        print(f"\n🔗 Initializing MixRank enricher (rate: {rate_limit} req/sec)")
+    # Initialize enricher (lazy for Snowflake - only connect if needed)
+    enricher = None
+    snowflake_initialized = False
+    
+    def get_snowflake_enricher():
+        nonlocal enricher, snowflake_initialized
+        if snowflake_initialized:
+            return enricher
+        print(f"\n🔗 Initializing Snowflake enricher (batch size: {snowflake_batch_size})")
         try:
-            enricher = MixRankEnricher(requests_per_second=rate_limit)
-        except ValueError as e:
+            enricher = SnowflakeEnricher(batch_size=snowflake_batch_size)
+            success, msg = enricher.test_connection()
+            if success:
+                print(f"   ✓ {msg}")
+            else:
+                print(f"   ✗ {msg}")
+                enricher = None
+        except Exception as e:
             print(f"   ✗ Error: {e}")
-            sys.exit(1)
+            enricher = None
+        snowflake_initialized = True
+        return enricher
+    
+    if not match_only:
+        if use_snowflake:
+            # Check if we need Snowflake at all (skip if all records cached)
+            uncached_count = sum(1 for r in valid_records if r.get('ID', '') not in cached_record_ids)
+            if uncached_count > 0:
+                print(f"\n🔗 {uncached_count:,} records need Snowflake enrichment")
+                enricher = get_snowflake_enricher()
+                if not enricher:
+                    print("   ✗ Failed to connect - will use cache only")
+            else:
+                print(f"\n✓ All {len(valid_records):,} records found in cache - Snowflake not needed")
+        else:
+            print(f"\n🔗 Initializing MixRank enricher (rate: {rate_limit} req/sec)")
+            try:
+                enricher = MixRankEnricher(requests_per_second=rate_limit)
+            except ValueError as e:
+                print(f"   ✗ Error: {e}")
+                sys.exit(1)
     
     # Initialize matcher
     print(f"\n🎯 Initializing matcher (LLM: {'enabled' if use_llm else 'disabled'})")
@@ -254,12 +340,32 @@ def run_analysis(
         enriched_data = None
         enrichment_error = None
         
-        if match_only:
+        # First check if record is already in cache (even if not in checkpoint.json)
+        if record_id in cached_record_ids:
+            enriched_data = checkpoint_mgr.get_cached_enrichment(record_id)
+            if enriched_data:
+                # Use cached data, skip enrichment
+                pass  # enriched_data is already set
+            else:
+                # ID was in cache scan but data not found (shouldn't happen)
+                tracker.update(success=False, message=f"Cache mismatch for {record_id}")
+                continue
+        elif match_only:
             # Try to get from cache
             enriched_data = checkpoint_mgr.get_cached_enrichment(record_id)
             if not enriched_data:
                 tracker.update(success=False, message=f"No cached data for {record_id}")
                 continue
+        elif use_snowflake:
+            # Query Snowflake (single record - for batching see below)
+            url_to_id = {linkedin_url: record_id}
+            sf_results = enricher.enrich_batch(url_to_id)
+            enrich_result = sf_results.get(linkedin_url)
+            
+            if enrich_result and enrich_result.success:
+                enriched_data = enrich_result.data
+            else:
+                enrichment_error = enrich_result.error if enrich_result else "Snowflake lookup failed"
         else:
             # Call MixRank API
             enrich_result = enricher.enrich_profile(linkedin_url)
@@ -685,6 +791,17 @@ Examples:
         action='store_true',
         help='Clear existing checkpoint and start fresh'
     )
+    parser.add_argument(
+        '--snowflake',
+        action='store_true',
+        help='Use Snowflake for enrichment instead of MixRank API'
+    )
+    parser.add_argument(
+        '--snowflake-batch-size',
+        type=int,
+        default=10000,
+        help='Batch size for Snowflake queries (default: 10000)'
+    )
     
     args = parser.parse_args()
     
@@ -712,7 +829,9 @@ Examples:
             checkpoint_interval=args.checkpoint_interval,
             rate_limit=args.rate_limit,
             use_llm=not args.no_llm,
-            llm_model=args.llm_model
+            llm_model=args.llm_model,
+            use_snowflake=args.snowflake,
+            snowflake_batch_size=args.snowflake_batch_size
         )
         
         # Exit code based on results

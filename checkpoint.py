@@ -155,14 +155,20 @@ class CheckpointManager:
             print(f"  Warning: Cache migration failed: {e}")
             return False
     
-    def _load_jsonl_cache(self) -> dict[str, Any]:
+    def _load_jsonl_cache(self, show_progress: bool = True) -> dict[str, Any]:
         """Load cache from JSONL file."""
         cache = {}
         if not self.cache_file.exists():
             return cache
         
+        # Get file size for progress
+        file_size = self.cache_file.stat().st_size
+        bytes_read = 0
+        last_pct = -1
+        
         with open(self.cache_file, 'r') as f:
             for line_num, line in enumerate(f, 1):
+                bytes_read += len(line.encode('utf-8'))
                 line = line.strip()
                 if not line:
                     continue
@@ -171,7 +177,16 @@ class CheckpointManager:
                     cache[entry["id"]] = entry["data"]
                 except (json.JSONDecodeError, KeyError) as e:
                     print(f"  Warning: Skipping malformed cache line {line_num}: {e}")
+                
+                # Progress update every 5%
+                if show_progress and file_size > 0:
+                    pct = int(bytes_read / file_size * 100)
+                    if pct >= last_pct + 5:
+                        print(f"\r   Loading cache... {pct}% ({len(cache):,} entries)", end="", flush=True)
+                        last_pct = pct
         
+        if show_progress:
+            print()  # Newline after progress
         return cache
     
     def load_checkpoint(self) -> bool:

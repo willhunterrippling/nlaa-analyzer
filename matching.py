@@ -115,6 +115,18 @@ def get_tokens(name: str) -> set:
     return {t for t in tokens if len(t) > 1}
 
 
+def get_first_significant_token(name: str) -> str:
+    """Get the first significant token (likely the core company name)."""
+    normalized = normalize_company_name(name)
+    tokens = re.split(r'[\s-]+', normalized)
+    # Skip very short tokens and common prefixes
+    skip_words = {'the', 'a', 'an', 'one', 'new'}
+    for token in tokens:
+        if len(token) > 2 and token not in skip_words:
+            return token
+    return tokens[0] if tokens else ""
+
+
 def calculate_token_overlap(name1: str, name2: str) -> float:
     """
     Calculate token overlap score between two names.
@@ -136,8 +148,51 @@ def calculate_token_overlap(name1: str, name2: str) -> float:
     smaller = min(len(tokens1), len(tokens2))
     coverage = len(intersection) / smaller if smaller else 0.0
     
-    # Combined score (weight coverage higher for substring-like matches)
-    return (jaccard + coverage * 2) / 3
+    # Base score (weight coverage higher for substring-like matches)
+    base_score = (jaccard + coverage * 2) / 3
+    
+    # TARGETED BOOST for specific patterns where first-token matching is reliable:
+    # 1. Law firms: "DeWitt LLP" should match "DeWitt · Giger, LLP"
+    # 2. Simple names: "Google" should match "Google LLC"
+    # 
+    # But NOT for industry-differentiated names:
+    # - "Winco Foods" vs "Winco Mfg." (different industries)
+    # - "Clover Management" vs "One Clover" (management indicates business type)
+    
+    first1 = get_first_significant_token(name1)
+    first2 = get_first_significant_token(name2)
+    
+    if first1 and first2 and first1 == first2 and len(first1) >= 4:
+        # Check for business-type words that differentiate companies
+        business_type_words = {
+            # Industry descriptors
+            'foods', 'food', 'mfg', 'manufacturing', 'retail', 'tech', 
+            'software', 'hardware', 'bio', 'pharma', 'medical', 'health',
+            'management', 'consulting', 'capital', 'ventures', 'financial',
+            'insurance', 'bank', 'banking', 'realty', 'properties',
+            'construction', 'engineering', 'logistics', 'transport',
+            'energy', 'oil', 'gas', 'mining', 'steel', 'auto', 'motors',
+            # Business structure words that matter
+            'store', 'stores', 'shop', 'restaurant', 'hotels', 'club',
+        }
+        
+        other_tokens1 = tokens1 - {first1}
+        other_tokens2 = tokens2 - {first2}
+        
+        # If EITHER side has a business-type word that the other doesn't share,
+        # they're likely different companies (e.g., "Winco Foods" vs "Winco Mfg")
+        type_words1 = other_tokens1 & business_type_words
+        type_words2 = other_tokens2 & business_type_words
+        
+        has_business_type_conflict = bool(
+            (type_words1 or type_words2) and  # At least one has a type word
+            type_words1 != type_words2         # And they don't match
+        )
+        
+        if not has_business_type_conflict:
+            base_score = max(base_score, 0.55)
+    
+    return base_score
 
 
 def programmatic_match(
